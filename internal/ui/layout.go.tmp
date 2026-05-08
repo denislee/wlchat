@@ -1,0 +1,204 @@
+func (a *App) layout(gtx layout.Context) {
+	a.theme.Palette.Bg = bgColor
+	a.theme.Palette.Fg = textColor
+
+	// Global background.
+	paint.Fill(gtx.Ops, bgColor)
+
+	layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(a.layoutTopBar),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					gtx.Constraints.Min.X = gtx.Dp(260)
+					gtx.Constraints.Max.X = gtx.Dp(260)
+					return a.layoutSidebar(gtx)
+				}),
+				layout.Flexed(1, a.layoutChat),
+			)
+		}),
+	)
+
+	if a.showModelPicker {
+		a.layoutModelPicker(gtx)
+	}
+	if a.showSkillPicker {
+		a.layoutSkillPicker(gtx)
+	}
+}
+
+func (a *App) layoutTopBar(gtx layout.Context) layout.Dimensions {
+	height := gtx.Dp(44)
+	gtx.Constraints.Min.Y = height
+	gtx.Constraints.Max.Y = height
+
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			return fillRect(gtx, panelColor)
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			prov := a.providers[a.provIdx]
+			return layout.Inset{Left: 16, Right: 16}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						lbl := material.H6(a.theme, "wlchat")
+						lbl.Color = accentColor
+						return lbl.Layout(gtx)
+					}),
+					layout.Flexed(1, layout.Spacer{}.Layout),
+					layout.Rigid(pillButton(a.theme, &a.provBtn, prov.Name(), accentColor)),
+					layout.Rigid(layout.Spacer{Width: 8}.Layout),
+					layout.Rigid(pillButton(a.theme, &a.modelBtn, prov.GetModel(), panelLight)),
+					layout.Rigid(layout.Spacer{Width: 8}.Layout),
+					layout.Rigid(pillButton(a.theme, &a.skillBtn, skillLabel(a), panelLight)),
+				)
+			})
+		}),
+	)
+}
+
+func (a *App) layoutSidebar(gtx layout.Context) layout.Dimensions {
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			return fillRect(gtx, panelColor)
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: 8, Bottom: 4, Left: 8, Right: 8}.Layout(gtx,
+						func(gtx layout.Context) layout.Dimensions {
+							return material.ButtonLayoutStyle{
+								Background:   accentColor,
+								CornerRadius: 8,
+								Button:       &a.newBtn,
+							}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return layout.Inset{Top: 8, Bottom: 8}.Layout(gtx,
+										func(gtx layout.Context) layout.Dimensions {
+											lbl := material.Body1(a.theme, "+ new chat")
+											lbl.Color = bgColor
+											return lbl.Layout(gtx)
+										})
+								})
+							})
+						})
+				}),
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return material.List(a.theme, &a.convList).Layout(gtx, len(a.convs),
+						func(gtx layout.Context, i int) layout.Dimensions {
+							return a.layoutConvRow(gtx, a.convs[i])
+						})
+				}),
+			)
+		}),
+	)
+}
+
+func (a *App) layoutChat(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Flexed(1, a.layoutMessages),
+		layout.Rigid(a.layoutInput),
+	)
+}
+
+func (a *App) layoutMessages(gtx layout.Context) layout.Dimensions {
+	// IMPORTANT: Use gtx.Constraints.Max.Y to ensure we take all available space.
+	size := gtx.Constraints.Max
+	gtx.Constraints.Min = size
+
+	// DEBUG: Bright red background.
+	paint.FillShape(gtx.Ops, dangerColor, clip.Rect{Max: size}.Op())
+
+	a.mu.Lock()
+	var msgs []conversation.Message
+	if a.current != nil {
+		msgs = append(msgs, a.current.Messages...)
+	}
+	streaming := a.streaming
+	streamText := a.streamBuf.String()
+	errMsg := a.pendingErr
+	a.mu.Unlock()
+
+	count := len(msgs)
+	if streaming || streamText != "" {
+		count++
+	}
+	if errMsg != "" {
+		count++
+	}
+
+	if count == 0 {
+		layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.H6(a.theme, "HISTORY BOX")
+			lbl.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+			return lbl.Layout(gtx)
+		})
+	} else {
+		layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return material.List(a.theme, &a.chatList).Layout(gtx, count,
+				func(gtx layout.Context, i int) layout.Dimensions {
+					if i < len(msgs) {
+						return a.messageBubble(gtx, msgs[i].Role, msgs[i].Content, msgs[i].Model)
+					}
+					if i == len(msgs) && (streaming || streamText != "") {
+						txt := streamText
+						if txt == "" {
+							txt = "…"
+						}
+						return a.messageBubble(gtx, "assistant", txt, a.providers[a.provIdx].GetModel())
+					}
+					return layout.Inset{Top: 6, Bottom: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Body2(a.theme, "error: "+errMsg)
+						lbl.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+						return lbl.Layout(gtx)
+					})
+				})
+		})
+	}
+
+	return layout.Dimensions{Size: size}
+}
+
+func (a *App) layoutInput(gtx layout.Context) layout.Dimensions {
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			return fillRect(gtx, panelColor)
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						return layout.Stack{}.Layout(gtx,
+							layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+								rect := clip.RRect{
+									Rect: image.Rectangle{Max: gtx.Constraints.Min},
+									SE:   8, SW: 8, NE: 8, NW: 8,
+								}
+								paint.FillShape(gtx.Ops, panelLight, rect.Op(gtx.Ops))
+								return layout.Dimensions{Size: gtx.Constraints.Min}
+							}),
+							layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+								return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									ed := material.Editor(a.theme, &a.input, "Type a message...")
+									ed.Color = textColor
+									return ed.Layout(gtx)
+								})
+							}),
+						)
+					}),
+					layout.Rigid(layout.Spacer{Width: 12}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						btn := material.Button(a.theme, &a.sendBtn, "Send")
+						if a.streaming {
+							btn.Text = "Stop"
+							btn.Background = dangerColor
+						} else {
+							btn.Background = accentColor
+						}
+						return btn.Layout(gtx)
+					}),
+				)
+			})
+		}),
+	)
+}

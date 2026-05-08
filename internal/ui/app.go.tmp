@@ -1,0 +1,52 @@
+func (a *App) layoutMessages(gtx layout.Context) layout.Dimensions {
+	gtx.Constraints.Min = gtx.Constraints.Max
+	paint.FillShape(gtx.Ops, panelLight, clip.Rect{Max: gtx.Constraints.Max}.Op())
+
+	a.mu.Lock()
+	var msgs []conversation.Message
+	if a.current != nil {
+		msgs = append(msgs, a.current.Messages...)
+	}
+	streaming := a.streaming
+	streamText := a.streamBuf.String()
+	errMsg := a.pendingErr
+	a.mu.Unlock()
+
+	count := len(msgs)
+	if streaming || streamText != "" {
+		count++
+	}
+	if errMsg != "" {
+		count++
+	}
+
+	if count == 0 {
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.H6(a.theme, "History Box (Empty)")
+			lbl.Color = color.NRGBA{R: 255, A: 255} // RED for visibility
+			return lbl.Layout(gtx)
+		})
+	}
+
+	return layout.Inset{Left: 16, Right: 16, Top: 8, Bottom: 8}.Layout(gtx,
+		func(gtx layout.Context) layout.Dimensions {
+			return material.List(a.theme, &a.chatList).Layout(gtx, count,
+				func(gtx layout.Context, i int) layout.Dimensions {
+					if i < len(msgs) {
+						return a.messageBubble(gtx, msgs[i].Role, msgs[i].Content, msgs[i].Model)
+					}
+					if i == len(msgs) && (streaming || streamText != "") {
+						txt := streamText
+						if txt == "" {
+							txt = "…"
+						}
+						return a.messageBubble(gtx, "assistant", txt, a.providers[a.provIdx].GetModel())
+					}
+					return layout.Inset{Top: 6, Bottom: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Body2(a.theme, "error: "+errMsg)
+						lbl.Color = dangerColor
+						return lbl.Layout(gtx)
+					})
+				})
+		})
+}
