@@ -21,6 +21,7 @@ import (
 	"gioui.org/io/clipboard"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
+	"gioui.org/io/transfer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -233,6 +234,13 @@ func (a *App) loop(w *app.Window) error {
 			a.handleClicks(gtx)
 			a.layout(gtx)
 			e.Frame(gtx.Ops)
+		case transfer.DataEvent:
+			if rc := e.Open(); rc != nil {
+				data, _ := io.ReadAll(rc)
+				rc.Close()
+				a.input.Insert(string(data))
+				w.Invalidate()
+			}
 		}
 	}
 }
@@ -335,18 +343,26 @@ func (a *App) handleKeys(gtx layout.Context) {
 					a.cancelStream()
 				} else {
 					a.mu.Lock()
+					count := 0
 					if a.current != nil {
-						count := len(a.current.Messages)
+						count = len(a.current.Messages)
 						if a.streaming || a.streamBuf.Len() > 0 {
 							count++
 						}
 						if a.pendingErr != "" {
 							count++
 						}
-						if count > 0 {
-							a.msgIdx = count - 1
-							ensureVisible(&a.chatList, a.msgIdx, count)
-							a.focusOnMessages = true
+					}
+					if count > 0 {
+						a.msgIdx = count - 1
+						ensureVisible(&a.chatList, a.msgIdx, count)
+						a.focusOnMessages = true
+						a.focusOnSidebar = false
+					} else {
+						a.focusOnMessages = false
+						a.focusOnSidebar = true
+						if a.convIdx < 0 && len(a.convs) > 0 {
+							a.convIdx = 0
 						}
 					}
 					a.mu.Unlock()
@@ -447,8 +463,10 @@ func (a *App) handleKeys(gtx layout.Context) {
 						a.providers[a.provIdx].SetModel(entry.name)
 						a.saveConfig()
 						a.showModelPicker = false
+						gtx.Execute(key.FocusCmd{Tag: &a.input})
 					}
 				} else if a.showSkillPicker {
+					oldSkill := a.activeSkill
 					if a.pickerIdx == 0 {
 						fmt.Printf("info: skill cleared\n")
 						a.activeSkill = ""
@@ -456,13 +474,18 @@ func (a *App) handleKeys(gtx layout.Context) {
 						fmt.Printf("info: selected skill %s\n", a.skills[a.pickerIdx-1].Mode)
 						a.activeSkill = a.skills[a.pickerIdx-1].Mode
 					}
+					if a.activeSkill != oldSkill {
+						a.newChat()
+					}
 					a.showSkillPicker = false
+					gtx.Execute(key.FocusCmd{Tag: &a.input})
 				} else if a.showProvPicker {
 					if a.pickerIdx < len(a.providers) {
 						fmt.Printf("info: switched to provider %s\n", a.providers[a.pickerIdx].Name())
 						a.provIdx = a.pickerIdx
 						a.saveConfig()
 						a.showProvPicker = false
+						gtx.Execute(key.FocusCmd{Tag: &a.input})
 					}
 				}
 			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "J":
@@ -640,6 +663,9 @@ func (a *App) handleClicks(gtx layout.Context) {
 	for id, c := range a.convClicks {
 		if c.Clicked(gtx) {
 			a.openConv(id)
+			a.focusOnMessages = false
+			a.focusOnSidebar = false
+			a.msgIdx = -1
 		}
 	}
 	for id, c := range a.convDelete {
@@ -668,10 +694,14 @@ func (a *App) handleClicks(gtx layout.Context) {
 			continue
 		}
 		if c.Clicked(gtx) {
+			oldSkill := a.activeSkill
 			if i == 0 {
 				a.activeSkill = ""
 			} else if i-1 < len(a.skills) {
 				a.activeSkill = a.skills[i-1].Mode
+			}
+			if a.activeSkill != oldSkill {
+				a.newChat()
 			}
 			a.showSkillPicker = false
 		}
@@ -700,6 +730,9 @@ func (a *App) newChat() {
 	a.pendingErr = ""
 	a.mu.Unlock()
 	a.input.SetText("")
+	a.focusOnMessages = false
+	a.focusOnSidebar = false
+	a.msgIdx = -1
 }
 
 func (a *App) openConv(id string) {
