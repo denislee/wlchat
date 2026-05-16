@@ -11,15 +11,12 @@ import (
 	"io"
 	"log"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"gioui.org/app"
 	"gioui.org/font"
-	"gioui.org/io/clipboard"
-	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/transfer"
 	"gioui.org/layout"
@@ -112,8 +109,21 @@ type App struct {
 
 	allModels []modelEntry
 
+	// Cached picker option labels (built once; skills/providers don't change
+	// at runtime, so we don't rebuild per-frame).
+	skillOptions []string
+	provOptions  []string
+
 	// Async UI invalidation.
 	window *app.Window
+
+	// saveCh feeds a background goroutine that persists conversations off the
+	// UI goroutine. The channel has buffer 1 and is overwritten under
+	// saveMu — older pending saves are dropped (only the latest state of a
+	// conversation matters).
+	saveCh   chan conversation.Conversation
+	saveMu   sync.Mutex
+	saveDone chan struct{}
 
 	focused         bool // tracks if initial focus has been applied
 	msgIdx          int  // selected message index for j/k navigation
@@ -156,14 +166,12 @@ func newApp(s *store.Store, providers []provider.Provider) *App {
 	if cfg, err := s.LoadConfig(); err == nil {
 		a.skills = cfg.Skills
 
-		// Restore fonts
 		a.theme.Fonts.Global = FontStyle{Face: cfg.Fonts.Global.Face, Size: cfg.Fonts.Global.Size}
 		a.theme.Fonts.Sidebar = FontStyle{Face: cfg.Fonts.Sidebar.Face, Size: cfg.Fonts.Sidebar.Size}
 		a.theme.Fonts.Header = FontStyle{Face: cfg.Fonts.Header.Face, Size: cfg.Fonts.Header.Size}
 		a.theme.Fonts.Messages = FontStyle{Face: cfg.Fonts.Messages.Face, Size: cfg.Fonts.Messages.Size}
 		a.theme.Fonts.Input = FontStyle{Face: cfg.Fonts.Input.Face, Size: cfg.Fonts.Input.Size}
 
-		// Fallback for global size if not set
 		if a.theme.Fonts.Global.Size == 0 {
 			a.theme.Fonts.Global.Size = 13
 		}
@@ -185,8 +193,69 @@ func newApp(s *store.Store, providers []provider.Provider) *App {
 			}
 		}
 	}
+	a.rebuildSkillOptions()
+	a.rebuildProvOptions()
 	a.refreshConvs()
+
+	a.saveCh = make(chan conversation.Conversation, 1)
+	a.saveDone = make(chan struct{})
+	go a.saveLoop()
+
 	return a
+}
+
+func (a *App) shutdown() {
+	a.saveMu.Lock()
+	if a.saveCh != nil {
+		close(a.saveCh)
+		a.saveCh = nil
+	}
+	a.saveMu.Unlock()
+	<-a.saveDone
+}
+
+// queueSave enqueues a conversation snapshot for async persistence,
+// coalescing with any pending save (only the most recent state is kept).
+func (a *App) queueSave(conv conversation.Conversation) {
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	if a.saveCh == nil {
+		return // shutdown in progress
+	}
+	select {
+	case <-a.saveCh:
+	default:
+	}
+	a.saveCh <- conv
+}
+
+func (a *App) saveLoop() {
+	defer close(a.saveDone)
+	for conv := range a.saveCh {
+		if err := a.store.Save(conv); err != nil {
+			fmt.Printf("error: failed to save conversation: %v\n", err)
+		}
+	}
+}
+
+func (a *App) rebuildSkillOptions() {
+	opts := make([]string, 0, len(a.skills)+1)
+	opts = append(opts, "(none)")
+	for _, s := range a.skills {
+		opts = append(opts, s.Title+"  ["+s.Mode+"]")
+	}
+	if len(a.skills) == 0 {
+		opts = append(opts, fmt.Sprintf("define skills in %s/config.json", a.store.ConfigDir()))
+	}
+	a.skillOptions = opts
+}
+
+func (a *App) rebuildProvOptions() {
+	opts := make([]string, len(a.providers))
+	for i, p := range a.providers {
+		opts[i] = p.Name()
+	}
+	a.provOptions = opts
 }
 
 func (a *App) saveConfig() {
@@ -209,12 +278,29 @@ func (a *App) uiToStoreFonts() store.SectionFonts {
 	}
 }
 
+// messageCount returns the number of rows that would be rendered in the chat
+// list (real messages + an in-flight streaming row + a pending-error row).
+// Caller must hold a.mu.
+func (a *App) messageCount() int {
+	if a.current == nil {
+		return 0
+	}
+	count := len(a.current.Messages)
+	if a.streaming || a.streamBuf.Len() > 0 {
+		count++
+	}
+	if a.pendingErr != "" {
+		count++
+	}
+	return count
+}
+
 func (a *App) refreshConvs() {
 	convs, err := a.store.ListMeta()
 	if err != nil {
 		return
 	}
-	sort.Slice(convs, func(i, j int) bool { return convs[i].CreatedAt.After(convs[j].CreatedAt) })
+	// SQLite ListMeta already returns ORDER BY created_at DESC.
 	a.convs = convs
 }
 
@@ -227,6 +313,7 @@ func (a *App) loop(w *app.Window) error {
 		switch e := w.Event().(type) {
 		case app.DestroyEvent:
 			a.cancelStream()
+			a.shutdown()
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
@@ -243,396 +330,6 @@ func (a *App) loop(w *app.Window) error {
 			}
 		}
 	}
-}
-
-func (a *App) handleKeys(gtx layout.Context) {
-	// Process editor events only if no pickers or settings are open.
-	if !a.showModelPicker && !a.showSkillPicker && !a.settingsOpen {
-		for {
-			ev, ok := a.input.Update(gtx)
-			if !ok {
-				break
-			}
-			if _, ok := ev.(widget.SubmitEvent); ok {
-				a.send()
-			}
-		}
-	}
-
-	// Listen for shortcuts.
-	for {
-		ev, ok := gtx.Event(
-			key.Filter{Name: key.NameReturn, Required: key.ModCtrl},
-			key.Filter{Name: key.NameEscape},
-			key.Filter{Name: "[", Required: key.ModCtrl},
-			key.Filter{Name: "K", Required: key.ModCtrl},
-			key.Filter{Name: "N", Required: key.ModCtrl},
-			key.Filter{Name: "M", Required: key.ModCtrl},
-			key.Filter{Name: "P", Required: key.ModCtrl},
-			key.Filter{Name: "F", Required: key.ModCtrl},
-			key.Filter{Name: "B", Required: key.ModCtrl},
-			key.Filter{Name: "W", Required: key.ModCtrl},
-			key.Filter{Name: key.NameDeleteBackward, Required: key.ModCtrl},
-			key.Filter{Name: ","},
-			key.Filter{Name: "J"},
-			key.Filter{Name: "K"},
-			key.Filter{Name: "I"},
-			key.Filter{Name: "Y"},
-			key.Filter{Name: "H"},
-			key.Filter{Name: "L"},
-			key.Filter{Name: key.NameTab},
-			key.Filter{Name: key.NameReturn},
-		)
-		if !ok {
-			break
-		}
-		if ke, ok := ev.(key.Event); ok && ke.State == key.Press {
-			switch {
-			case ke.Name == key.NameTab:
-				if a.focusOnSidebar {
-					// sidebar -> chat log
-					a.focusOnSidebar = false
-					a.focusOnMessages = true
-					a.mu.Lock()
-					if a.current != nil {
-						count := len(a.current.Messages)
-						if a.streaming || a.streamBuf.Len() > 0 {
-							count++
-						}
-						if a.pendingErr != "" {
-							count++
-						}
-						if count > 0 {
-							a.msgIdx = count - 1
-							ensureVisible(&a.chatList, a.msgIdx, count)
-						}
-					}
-					a.mu.Unlock()
-				} else if a.focusOnMessages {
-					// chat log -> message input
-					a.focusOnMessages = false
-					a.focusOnSidebar = false
-					gtx.Execute(key.FocusCmd{Tag: &a.input})
-				} else {
-					// message input -> sidebar
-					a.focusOnSidebar = true
-					a.focusOnMessages = false
-					// Find current conversation index if any
-					a.mu.Lock()
-					if a.current != nil {
-						for i, c := range a.convs {
-							if c.ID == a.current.ID {
-								a.convIdx = i
-								ensureVisible(&a.convList, i, len(a.convs))
-								break
-							}
-						}
-					}
-					a.mu.Unlock()
-				}
-			case ke.Name == key.NameReturn && ke.Modifiers.Contain(key.ModCtrl):
-				a.send()
-			case ke.Name == key.NameEscape || (ke.Name == "[" && ke.Modifiers.Contain(key.ModCtrl)):
-				if a.showModelPicker || a.showSkillPicker || a.showProvPicker || a.settingsOpen || a.showDeleteConfirm {
-					a.showModelPicker = false
-					a.showSkillPicker = false
-					a.showProvPicker = false
-					a.settingsOpen = false
-					a.showDeleteConfirm = false
-				} else if a.streaming {
-					a.cancelStream()
-				} else {
-					a.mu.Lock()
-					count := 0
-					if a.current != nil {
-						count = len(a.current.Messages)
-						if a.streaming || a.streamBuf.Len() > 0 {
-							count++
-						}
-						if a.pendingErr != "" {
-							count++
-						}
-					}
-					if count > 0 {
-						a.msgIdx = count - 1
-						ensureVisible(&a.chatList, a.msgIdx, count)
-						a.focusOnMessages = true
-						a.focusOnSidebar = false
-					} else {
-						a.focusOnMessages = false
-						a.focusOnSidebar = true
-						if a.convIdx < 0 && len(a.convs) > 0 {
-							a.convIdx = 0
-						}
-					}
-					a.mu.Unlock()
-				}
-			case ke.Name == ",":
-				if !gtx.Source.Focused(&a.input) {
-					a.settingsOpen = !a.settingsOpen
-					a.showModelPicker = false
-					a.showSkillPicker = false
-					a.showProvPicker = false
-					a.showDeleteConfirm = false
-				}
-			case ke.Name == "K" && ke.Modifiers.Contain(key.ModCtrl):
-				a.showSkillPicker = !a.showSkillPicker
-				a.showModelPicker = false
-				a.showProvPicker = false
-				a.showDeleteConfirm = false
-				a.pickerIdx = 0
-				a.lastPickerIdx = -1
-			case ke.Name == "M" && ke.Modifiers.Contain(key.ModCtrl):
-				a.showModelPicker = !a.showModelPicker
-				a.showSkillPicker = false
-				a.showProvPicker = false
-				a.showDeleteConfirm = false
-				a.pickerIdx = 0
-				a.lastPickerIdx = -1
-			case ke.Name == "P" && ke.Modifiers.Contain(key.ModCtrl):
-				a.showProvPicker = !a.showProvPicker
-				a.showModelPicker = false
-				a.showSkillPicker = false
-				a.showDeleteConfirm = false
-				a.pickerIdx = 0
-				a.lastPickerIdx = -1
-			case a.showDeleteConfirm && ke.Name == key.NameReturn:
-				a.deleteConv(a.convToDelete)
-				a.showDeleteConfirm = false
-			case a.focusOnSidebar && !gtx.Source.Focused(&a.input) && ke.Name == "D":
-				a.mu.Lock()
-				if a.convIdx >= 0 && a.convIdx < len(a.convs) {
-					a.convToDelete = a.convs[a.convIdx].ID
-					a.showDeleteConfirm = true
-				}
-				a.mu.Unlock()
-			case (ke.Name == "W" || ke.Name == key.NameDeleteBackward) && ke.Modifiers.Contain(key.ModCtrl):
-				if !a.showModelPicker && !a.showSkillPicker && !a.showProvPicker && !a.settingsOpen && !a.focusOnMessages {
-					DeleteWord(&a.input)
-				}
-			case ke.Name == "N" && ke.Modifiers.Contain(key.ModCtrl):
-				a.newChat()
-			case (a.showModelPicker || a.showSkillPicker || a.showProvPicker) && ke.Name == "J":
-				a.pickerIdx++
-				max := 0
-				switch {
-				case a.showModelPicker:
-					max = len(a.allModels)
-				case a.showSkillPicker:
-					max = len(a.skills) + 1 // +1 for (none)
-				case a.showProvPicker:
-					max = len(a.providers)
-				}
-				if a.pickerIdx >= max {
-					a.pickerIdx = max - 1
-				}
-			case (a.showModelPicker || a.showSkillPicker || a.showProvPicker) && ke.Name == "K":
-				a.pickerIdx--
-				if a.pickerIdx < 0 {
-					a.pickerIdx = 0
-				}
-			case (a.showModelPicker || a.showSkillPicker || a.showProvPicker) && ke.Name == "F" && ke.Modifiers.Contain(key.ModCtrl):
-				a.pickerIdx += 5
-				max := 0
-				switch {
-				case a.showModelPicker:
-					max = len(a.allModels)
-				case a.showSkillPicker:
-					max = len(a.skills) + 1
-				case a.showProvPicker:
-					max = len(a.providers)
-				}
-				if a.pickerIdx >= max {
-					maxVal := max - 1
-					if maxVal < 0 {
-						maxVal = 0
-					}
-					a.pickerIdx = maxVal
-				}
-			case (a.showModelPicker || a.showSkillPicker || a.showProvPicker) && ke.Name == "B" && ke.Modifiers.Contain(key.ModCtrl):
-				a.pickerIdx -= 5
-				if a.pickerIdx < 0 {
-					a.pickerIdx = 0
-				}
-			case (a.showModelPicker || a.showSkillPicker || a.showProvPicker) && ke.Name == key.NameReturn:
-				if a.showModelPicker {
-					if a.pickerIdx < len(a.allModels) {
-						entry := a.allModels[a.pickerIdx]
-						fmt.Printf("info: selected model %s for provider %s\n", entry.name, a.providers[entry.provIdx].Name())
-						a.provIdx = entry.provIdx
-						a.providers[a.provIdx].SetModel(entry.name)
-						a.saveConfig()
-						a.showModelPicker = false
-						gtx.Execute(key.FocusCmd{Tag: &a.input})
-					}
-				} else if a.showSkillPicker {
-					oldSkill := a.activeSkill
-					if a.pickerIdx == 0 {
-						fmt.Printf("info: skill cleared\n")
-						a.activeSkill = ""
-					} else if a.pickerIdx-1 < len(a.skills) {
-						fmt.Printf("info: selected skill %s\n", a.skills[a.pickerIdx-1].Mode)
-						a.activeSkill = a.skills[a.pickerIdx-1].Mode
-					}
-					if a.activeSkill != oldSkill {
-						a.newChat()
-					}
-					a.showSkillPicker = false
-					gtx.Execute(key.FocusCmd{Tag: &a.input})
-				} else if a.showProvPicker {
-					if a.pickerIdx < len(a.providers) {
-						fmt.Printf("info: switched to provider %s\n", a.providers[a.pickerIdx].Name())
-						a.provIdx = a.pickerIdx
-						a.saveConfig()
-						a.showProvPicker = false
-						gtx.Execute(key.FocusCmd{Tag: &a.input})
-					}
-				}
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "J":
-				a.mu.Lock()
-				count := 0
-				if a.current != nil {
-					count = len(a.current.Messages)
-					if a.streaming || a.streamBuf.Len() > 0 {
-						count++
-					}
-					if a.pendingErr != "" {
-						count++
-					}
-				}
-				if a.msgIdx < count-1 {
-					a.msgIdx++
-					ensureVisible(&a.chatList, a.msgIdx, count)
-				}
-				a.mu.Unlock()
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "K":
-				a.mu.Lock()
-				count := 0
-				if a.current != nil {
-					count = len(a.current.Messages)
-					if a.streaming || a.streamBuf.Len() > 0 {
-						count++
-					}
-					if a.pendingErr != "" {
-						count++
-					}
-				}
-				if a.msgIdx > 0 {
-					a.msgIdx--
-					ensureVisible(&a.chatList, a.msgIdx, count)
-				}
-				a.mu.Unlock()
-			case a.focusOnSidebar && !gtx.Source.Focused(&a.input) && ke.Name == "J":
-				a.mu.Lock()
-				if a.convIdx < len(a.convs)-1 {
-					a.convIdx++
-					ensureVisible(&a.convList, a.convIdx, len(a.convs))
-					id := a.convs[a.convIdx].ID
-					a.mu.Unlock()
-					a.openConv(id)
-				} else {
-					a.mu.Unlock()
-				}
-			case a.focusOnSidebar && !gtx.Source.Focused(&a.input) && ke.Name == "K":
-				a.mu.Lock()
-				if a.convIdx > 0 {
-					a.convIdx--
-					ensureVisible(&a.convList, a.convIdx, len(a.convs))
-					id := a.convs[a.convIdx].ID
-					a.mu.Unlock()
-					a.openConv(id)
-				} else {
-					a.mu.Unlock()
-				}
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "H":
-				a.focusOnMessages = false
-				a.focusOnSidebar = true
-				// Find current conversation index
-				a.mu.Lock()
-				if a.current != nil {
-					for i, c := range a.convs {
-						if c.ID == a.current.ID {
-							a.convIdx = i
-							ensureVisible(&a.convList, i, len(a.convs))
-							break
-						}
-					}
-				}
-				a.mu.Unlock()
-			case a.focusOnSidebar && !gtx.Source.Focused(&a.input) && ke.Name == "L":
-				a.focusOnSidebar = false
-				a.focusOnMessages = true
-				a.mu.Lock()
-				if a.current != nil {
-					count := len(a.current.Messages)
-					if a.streaming || a.streamBuf.Len() > 0 {
-						count++
-					}
-					if a.pendingErr != "" {
-						count++
-					}
-					if count > 0 {
-						a.msgIdx = count - 1
-						ensureVisible(&a.chatList, a.msgIdx, count)
-					}
-				}
-				a.mu.Unlock()
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "F" && ke.Modifiers.Contain(key.ModCtrl):
-				a.mu.Lock()
-				count := 0
-				if a.current != nil {
-					count = len(a.current.Messages)
-					if a.streaming || a.streamBuf.Len() > 0 {
-						count++
-					}
-					if a.pendingErr != "" {
-						count++
-					}
-				}
-				if count > 0 {
-					a.msgIdx += 5
-					if a.msgIdx >= count {
-						a.msgIdx = count - 1
-					}
-					ensureVisible(&a.chatList, a.msgIdx, count)
-				}
-				a.mu.Unlock()
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "B" && ke.Modifiers.Contain(key.ModCtrl):
-				a.mu.Lock()
-				count := 0
-				if a.current != nil {
-					count = len(a.current.Messages)
-					if a.streaming || a.streamBuf.Len() > 0 {
-						count++
-					}
-					if a.pendingErr != "" {
-						count++
-					}
-				}
-				if count > 0 {
-					a.msgIdx -= 5
-					if a.msgIdx < 0 {
-						a.msgIdx = 0
-					}
-					ensureVisible(&a.chatList, a.msgIdx, count)
-				}
-				a.mu.Unlock()
-			case a.focusOnMessages && !gtx.Source.Focused(&a.input) && ke.Name == "Y":
-				a.mu.Lock()
-				if a.current != nil && a.msgIdx >= 0 && a.msgIdx < len(a.current.Messages) {
-					content := a.current.Messages[a.msgIdx].Content
-					gtx.Execute(clipboard.WriteCmd{Data: io.NopCloser(strings.NewReader(content))})
-				}
-				a.mu.Unlock()
-			case !gtx.Source.Focused(&a.input) && ke.Name == "I":
-				a.focusOnMessages = false
-				a.focusOnSidebar = false
-				gtx.Execute(key.FocusCmd{Tag: &a.input})
-			}
-		}
-	}
-	// Tell Gio we want focus on a stable area to receive shortcuts.
-	event.Op(gtx.Ops, a)
 }
 
 func (a *App) handleClicks(gtx layout.Context) {
@@ -681,7 +378,6 @@ func (a *App) handleClicks(gtx layout.Context) {
 		if c.Clicked(gtx) {
 			if i < len(a.allModels) {
 				entry := a.allModels[i]
-				fmt.Printf("info: clicked model %s for provider %s\n", entry.name, a.providers[entry.provIdx].Name())
 				a.provIdx = entry.provIdx
 				a.providers[a.provIdx].SetModel(entry.name)
 				a.saveConfig()
@@ -758,6 +454,8 @@ func (a *App) deleteConv(id string) {
 	if a.current != nil && a.current.ID == id {
 		a.current = nil
 	}
+	delete(a.convClicks, id)
+	delete(a.convDelete, id)
 	a.mu.Unlock()
 	a.refreshConvs()
 }
@@ -796,6 +494,7 @@ func (a *App) send() {
 		}
 	}
 
+	newConv := false
 	if a.current == nil {
 		title := text
 		if len(title) > 60 {
@@ -803,17 +502,16 @@ func (a *App) send() {
 		}
 		c := conversation.New(title)
 		a.current = &c
+		newConv = true
 	}
 	a.current.Messages = append(a.current.Messages, conversation.Message{
 		Role:    "user",
 		Content: text,
 	})
-	if err := a.store.Save(*a.current); err != nil {
-		fmt.Printf("error: failed to save conversation: %v\n", err)
-		a.pendingErr = err.Error()
-	}
+	saveSnapshot := *a.current
 
 	convCopy := *a.current
+	convCopy.Messages = truncateHistory(convCopy.Messages, maxProviderMessages)
 	if prompt != text {
 		msgs := make([]conversation.Message, len(convCopy.Messages))
 		copy(msgs, convCopy.Messages)
@@ -825,14 +523,17 @@ func (a *App) send() {
 	a.streamCancel = cancel
 	a.streaming = true
 
-	// Set msgIdx to the upcoming assistant message so we follow it.
 	a.msgIdx = len(a.current.Messages)
 	a.focusOnMessages = true
 
 	prov := a.providers[a.provIdx]
 	model := prov.GetModel()
 	a.mu.Unlock()
-	a.refreshConvs()
+
+	a.queueSave(saveSnapshot)
+	if newConv {
+		a.refreshConvs()
+	}
 
 	go a.streamLoop(ctx, prov, model, convCopy)
 }
@@ -896,12 +597,14 @@ func (a *App) streamLoop(ctx context.Context, prov provider.Provider, model stri
 
 func (a *App) finalizeStream(model, errMsg string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.current == nil {
+		a.mu.Unlock()
 		return
 	}
 	content := a.streamBuf.String()
 	a.streamBuf.Reset()
+	var snapshot conversation.Conversation
+	save := false
 	if content != "" {
 		a.current.Messages = append(a.current.Messages, conversation.Message{
 			Role:    "assistant",
@@ -909,12 +612,16 @@ func (a *App) finalizeStream(model, errMsg string) {
 			Model:   model,
 		})
 		a.msgIdx = len(a.current.Messages) - 1
-		_ = a.store.Save(*a.current)
+		snapshot = *a.current
+		save = true
 	}
 	if errMsg != "" {
 		a.pendingErr = errMsg
 	}
-	a.refreshConvs()
+	a.mu.Unlock()
+	if save {
+		a.queueSave(snapshot)
+	}
 }
 
 func (a *App) layout(gtx layout.Context) {
@@ -932,7 +639,6 @@ func (a *App) layout(gtx layout.Context) {
 	a.theme.Mat.Palette.Bg = a.theme.Pal.Bg
 	a.theme.Mat.Palette.Fg = a.theme.Pal.Text
 
-	// Global background fill.
 	paint.Fill(gtx.Ops, a.theme.Pal.Bg)
 
 	if a.settingsOpen {
@@ -964,7 +670,6 @@ func (a *App) layout(gtx layout.Context) {
 }
 
 func (a *App) layoutDeleteConfirm(gtx layout.Context) {
-	// Dim the background.
 	paint.ColorOp{Color: color.NRGBA{A: 0x80}}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 
@@ -1177,7 +882,6 @@ func (a *App) layoutConvRow(gtx layout.Context, conv conversation.Conversation) 
 
 	return layout.Inset{Left: 6, Right: 6, Top: 1, Bottom: 1}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
-			// Determine the size of the content first
 			m := op.Record(gtx.Ops)
 			dims := material.ButtonLayoutStyle{
 				Background:   rowBg,
@@ -1229,8 +933,6 @@ func (a *App) layoutConvRow(gtx layout.Context, conv conversation.Conversation) 
 			call := m.Stop()
 			call.Add(gtx.Ops)
 
-			// Draw the left-edge selection indicator on top of the row
-			// background so it remains visible when the row is selected.
 			if selected {
 				r := image.Rect(0, 4, gtx.Dp(2), dims.Size.Y-4)
 				paint.FillShape(gtx.Ops, a.theme.Pal.Accent, clip.Rect(r).Op())
@@ -1264,7 +966,7 @@ func ensureVisible(list *widget.List, idx, listLen int) {
 	case idx == pos.First && pos.Offset > 0:
 		list.Position.Offset = 0
 	case idx > last, idx == last && pos.OffsetLast < 0:
-		itemH := 100 // Reasonable default for chat messages
+		itemH := 100
 		if pos.Length > 0 && listLen > 0 {
 			itemH = pos.Length / listLen
 			if itemH < 1 {
@@ -1273,6 +975,29 @@ func ensureVisible(list *widget.List, idx, listLen int) {
 		}
 		list.Position.Offset += (idx-last)*itemH - pos.OffsetLast
 	}
+}
+
+// maxProviderMessages caps how many trailing messages are sent to the
+// provider on each turn. The full transcript is still persisted and
+// rendered; only the API payload is bounded so token cost stays predictable
+// on long conversations.
+const maxProviderMessages = 40
+
+// truncateHistory returns the last n messages of msgs, snapped so the slice
+// begins with a "user" message (an orphaned "assistant" at the head confuses
+// most chat models).
+func truncateHistory(msgs []conversation.Message, n int) []conversation.Message {
+	if len(msgs) <= n {
+		return msgs
+	}
+	start := len(msgs) - n
+	for start < len(msgs) && msgs[start].Role != "user" {
+		start++
+	}
+	if start >= len(msgs) {
+		return msgs[len(msgs)-1:]
+	}
+	return msgs[start:]
 }
 
 func truncate(s string, n int) string {
@@ -1291,12 +1016,15 @@ func (a *App) layoutChat(gtx layout.Context) layout.Dimensions {
 }
 
 func (a *App) layoutMessages(gtx layout.Context) layout.Dimensions {
-	// Fill background for the chat area.
 	return paintedBg(gtx, a.theme.Pal.Bg, func(gtx layout.Context) layout.Dimensions {
+		// We can hold the slice header without copying the backing array:
+		// existing entries are append-only (never mutated in place), so
+		// readers see a stable snapshot even if a concurrent append in
+		// finalizeStream reallocates the backing array.
 		a.mu.Lock()
 		var msgs []conversation.Message
 		if a.current != nil {
-			msgs = append(msgs, a.current.Messages...)
+			msgs = a.current.Messages
 		}
 		streaming := a.streaming
 		streamText := a.streamBuf.String()
@@ -1329,31 +1057,30 @@ func (a *App) layoutMessages(gtx layout.Context) layout.Dimensions {
 					}),
 				)
 			})
-		} else {
-			if a.focusOnMessages {
-				ensureVisible(&a.chatList, a.msgIdx, count)
-			}
-			return material.List(a.theme.Mat, &a.chatList).Layout(gtx, count,
-				func(gtx layout.Context, i int) layout.Dimensions {
-					if i < len(msgs) {
-						ts := a.current.CreatedAt // fallback
-						return a.messageRow(gtx, i, msgs[i].Role, msgs[i].Content, msgs[i].Model, ts)
-					}
-					if i == len(msgs) && (streaming || streamText != "") {
-						txt := streamText
-						if txt == "" {
-							txt = "…"
-						}
-						return a.messageRow(gtx, i, "assistant", txt, a.providers[a.provIdx].GetModel(), time.Now())
-					}
-					return layout.Inset{Top: 6, Bottom: 6, Left: 24, Right: 24}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						lbl := material.Body2(a.theme.Mat, "error: "+errMsg)
-						lbl.Color = a.theme.Pal.Danger
-						a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-						return lbl.Layout(gtx)
-					})
-				})
 		}
+		if a.focusOnMessages {
+			ensureVisible(&a.chatList, a.msgIdx, count)
+		}
+		return material.List(a.theme.Mat, &a.chatList).Layout(gtx, count,
+			func(gtx layout.Context, i int) layout.Dimensions {
+				if i < len(msgs) {
+					ts := a.current.CreatedAt
+					return a.messageRow(gtx, i, msgs[i].Role, msgs[i].Content, msgs[i].Model, ts)
+				}
+				if i == len(msgs) && (streaming || streamText != "") {
+					txt := streamText
+					if txt == "" {
+						txt = "…"
+					}
+					return a.messageRow(gtx, i, "assistant", txt, a.providers[a.provIdx].GetModel(), time.Now())
+				}
+				return layout.Inset{Top: 6, Bottom: 6, Left: 24, Right: 24}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					lbl := material.Body2(a.theme.Mat, "error: "+errMsg)
+					lbl.Color = a.theme.Pal.Danger
+					a.theme.applyFont(&lbl, a.theme.Fonts.Global)
+					return lbl.Layout(gtx)
+				})
+			})
 	})
 }
 
@@ -1366,267 +1093,5 @@ func (a *App) layoutInput(gtx layout.Context) layout.Dimensions {
 		a.theme.applyFontToEditor(&ed, a.theme.Fonts.Input)
 
 		return ed.Layout(gtx)
-	})
-}
-
-func (a *App) layoutModelPicker(gtx layout.Context) {
-	if len(a.modelChoices) != len(a.allModels) {
-		a.modelChoices = make([]*widget.Clickable, len(a.allModels))
-		for i := range a.modelChoices {
-			a.modelChoices[i] = &widget.Clickable{}
-		}
-	}
-	if a.showModelPicker {
-		fmt.Printf("debug: rendering model picker with %d models\n", len(a.allModels))
-	}
-
-	// Dim the background to focus the modal.
-	paint.ColorOp{Color: color.NRGBA{A: 0x80}}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-
-	w := gtx.Dp(520) // Slightly wider for provider names
-	h := gtx.Constraints.Max.Y - gtx.Dp(80)
-	if h > gtx.Dp(600) {
-		h = gtx.Dp(600)
-	}
-
-	x := (gtx.Constraints.Max.X - w) / 2
-	y := (gtx.Constraints.Max.Y - h) / 2
-
-	// Ensure the selected item is visible if we just navigated.
-	if a.pickerIdx != a.lastPickerIdx {
-		if a.lastPickerIdx == -1 {
-			a.popupList.Position.First = 0
-			a.popupList.Position.Offset = 0
-		}
-		listH := h - gtx.Dp(56)
-		visCount := listH / gtx.Dp(40)
-		if visCount < 1 {
-			visCount = 1
-		}
-
-		if a.pickerIdx < a.popupList.Position.First {
-			a.popupList.Position.First = a.pickerIdx
-			a.popupList.Position.Offset = 0
-		} else if a.pickerIdx >= a.popupList.Position.First+visCount {
-			a.popupList.Position.First = a.pickerIdx - visCount + 1
-			a.popupList.Position.Offset = 0
-		}
-		a.lastPickerIdx = a.pickerIdx
-	}
-
-	defer op.Offset(image.Pt(x, y)).Push(gtx.Ops).Pop()
-
-	withBorder(gtx, a.theme.Pal.Border, borders{Top: true, Bottom: true, Left: true, Right: true}, func(gtx layout.Context) layout.Dimensions {
-		return paintedBg(gtx, a.theme.Pal.BgHeader, func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min = image.Pt(w, h)
-			gtx.Constraints.Max = image.Pt(w, h)
-			return layout.Inset{Top: 14, Bottom: 12, Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Inset{Left: 4, Bottom: 4}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							lbl := material.Caption(a.theme.Mat, "SELECT MODEL")
-							lbl.Color = a.theme.Pal.TextMuted
-							lbl.Font.Weight = font.Bold
-							a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-							return lbl.Layout(gtx)
-						})
-					}),
-					layout.Rigid(layout.Spacer{Height: 6}.Layout),
-					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						a.popupList.Axis = layout.Vertical
-						return material.List(a.theme.Mat, &a.popupList).Layout(gtx, len(a.allModels), func(gtx layout.Context, i int) layout.Dimensions {
-							entry := a.allModels[i]
-							isHeader := i == 0 || a.allModels[i-1].provIdx != entry.provIdx
-
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									if !isHeader {
-										return layout.Dimensions{}
-									}
-									return layout.Inset{Top: 12, Bottom: 4, Left: 4}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-										lbl := material.Caption(a.theme.Mat, strings.ToUpper(a.providers[entry.provIdx].Name()))
-										lbl.Color = a.theme.Pal.Accent
-										lbl.Font.Weight = font.Bold
-										a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-										return lbl.Layout(gtx)
-									})
-								}),
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									bg := color.NRGBA{}
-									if a.pickerIdx == i {
-										bg = a.theme.Pal.BgRowSelected
-									}
-
-									return layout.Inset{Top: 1, Bottom: 1}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-										return material.ButtonLayoutStyle{
-											Background:   bg,
-											CornerRadius: 4,
-											Button:       a.modelChoices[i],
-										}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-											return layout.Inset{Top: 8, Bottom: 8, Left: 12, Right: 12}.Layout(gtx,
-												func(gtx layout.Context) layout.Dimensions {
-													return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-														layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-															lbl := material.Body2(a.theme.Mat, entry.name)
-															lbl.Color = a.theme.Pal.Text
-															if a.provIdx == entry.provIdx && a.providers[a.provIdx].GetModel() == entry.name {
-																lbl.Font.Weight = font.Bold
-																lbl.Color = a.theme.Pal.TextStrong
-															}
-															a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-															return lbl.Layout(gtx)
-														}),
-														layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-															if a.provIdx == entry.provIdx && a.providers[a.provIdx].GetModel() == entry.name {
-																lbl := material.Caption(a.theme.Mat, "ACTIVE")
-																lbl.Color = a.theme.Pal.Accent
-																a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-																return lbl.Layout(gtx)
-															}
-															return layout.Dimensions{}
-														}),
-													)
-												})
-										})
-									})
-								}),
-							)
-						})
-					}),
-				)
-			})
-		})
-	})
-}
-
-func (a *App) layoutProvPicker(gtx layout.Context) {
-	var providers []string
-	for _, p := range a.providers {
-		providers = append(providers, p.Name())
-	}
-	if len(a.provChoices) != len(providers) {
-		a.provChoices = make([]*widget.Clickable, len(providers))
-		for i := range a.provChoices {
-			a.provChoices[i] = &widget.Clickable{}
-		}
-	}
-	if a.showProvPicker {
-		fmt.Printf("debug: rendering provider picker with %d providers: %v\n", len(providers), providers)
-	}
-	a.popupList.Axis = layout.Vertical
-	a.layoutPopup(gtx, "select provider", providers, a.provChoices)
-}
-
-func (a *App) layoutSkillPicker(gtx layout.Context) {
-	options := []string{"(none)"}
-	for _, s := range a.skills {
-		options = append(options, s.Title+"  ["+s.Mode+"]")
-	}
-	if len(a.skills) == 0 {
-		options = append(options, fmt.Sprintf("define skills in %s/config.json", a.store_dirHint()))
-	}
-	if len(a.skillChoices) != len(options) {
-		a.skillChoices = make([]*widget.Clickable, len(options))
-		for i := range a.skillChoices {
-			a.skillChoices[i] = &widget.Clickable{}
-		}
-	}
-	a.popupList.Axis = layout.Vertical
-	a.layoutPopup(gtx, "select skill", options, a.skillChoices)
-}
-
-func (a *App) store_dirHint() string {
-	return a.store.ConfigDir()
-}
-
-func (a *App) layoutPopup(gtx layout.Context, title string, items []string, clicks []*widget.Clickable) {
-	// Dim the background to focus the modal.
-	paint.ColorOp{Color: color.NRGBA{A: 0x80}}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-
-	w := gtx.Dp(420)
-	h := gtx.Dp(56) + gtx.Dp(40)*len(items)
-	if maxH := gtx.Constraints.Max.Y - gtx.Dp(80); h > maxH {
-		h = maxH
-	}
-	x := (gtx.Constraints.Max.X - w) / 2
-	y := (gtx.Constraints.Max.Y - h) / 2
-
-	// Ensure the selected item is visible if we just navigated.
-	if a.pickerIdx != a.lastPickerIdx {
-		if a.lastPickerIdx == -1 {
-			a.popupList.Position.First = 0
-			a.popupList.Position.Offset = 0
-		}
-		listH := h - gtx.Dp(56) // 56 is header + spacers
-		visCount := listH / gtx.Dp(40)
-		if visCount < 1 {
-			visCount = 1
-		}
-
-		if a.pickerIdx < a.popupList.Position.First {
-			a.popupList.Position.First = a.pickerIdx
-			a.popupList.Position.Offset = 0
-		} else if a.pickerIdx >= a.popupList.Position.First+visCount {
-			a.popupList.Position.First = a.pickerIdx - visCount + 1
-			a.popupList.Position.Offset = 0
-		}
-		a.lastPickerIdx = a.pickerIdx
-	}
-
-	defer op.Offset(image.Pt(x, y)).Push(gtx.Ops).Pop()
-
-	withBorder(gtx, a.theme.Pal.Border, borders{Top: true, Bottom: true, Left: true, Right: true}, func(gtx layout.Context) layout.Dimensions {
-		return paintedBg(gtx, a.theme.Pal.BgHeader, func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min = image.Pt(w, h)
-			gtx.Constraints.Max = image.Pt(w, h)
-			return layout.Inset{Top: 14, Bottom: 12, Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Inset{Left: 4, Bottom: 4}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							lbl := material.Caption(a.theme.Mat, strings.ToUpper(title))
-							lbl.Color = a.theme.Pal.TextMuted
-							lbl.Font.Weight = font.Bold
-							a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-							return lbl.Layout(gtx)
-						})
-					}),
-					layout.Rigid(layout.Spacer{Height: 6}.Layout),
-					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						return material.List(a.theme.Mat, &a.popupList).Layout(gtx, len(items), func(gtx layout.Context, i int) layout.Dimensions {
-							return layout.Inset{Top: 1, Bottom: 1}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-								var c *widget.Clickable
-								if i < len(clicks) {
-									c = clicks[i]
-								} else {
-									c = &widget.Clickable{}
-								}
-
-								bg := color.NRGBA{}
-								if a.pickerIdx == i {
-									bg = a.theme.Pal.BgRowSelected
-								}
-
-								return material.ButtonLayoutStyle{
-									Background:   bg,
-									CornerRadius: 4,
-									Button:       c,
-								}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-									return layout.Inset{Top: 9, Bottom: 9, Left: 12, Right: 12}.Layout(gtx,
-										func(gtx layout.Context) layout.Dimensions {
-											gtx.Constraints.Min.X = gtx.Constraints.Max.X
-											lbl := material.Body2(a.theme.Mat, items[i])
-											lbl.Color = a.theme.Pal.Text
-											a.theme.applyFont(&lbl, a.theme.Fonts.Global)
-											return lbl.Layout(gtx)
-										})
-								})
-							})
-						})
-					}),
-				)
-			})
-		})
 	})
 }

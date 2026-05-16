@@ -17,16 +17,11 @@ import (
 const apiURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 var Models = []string{
-	"gemini-3.1-pro",
-	"gemini-3.1-flash",
-	"gemini-3.1-flash-lite",
+	"gemini-3-pro-preview",
 	"gemini-2.5-pro",
 	"gemini-2.5-flash",
 	"gemini-2.5-flash-lite",
-	"gemini-3.1-pro-thinking",
-	"gemini-experimental",
 	"gemma-3-27b-it",
-	"gemma-4-31b-it",
 }
 
 type Client struct {

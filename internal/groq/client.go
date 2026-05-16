@@ -205,8 +205,13 @@ var compoundTags = []struct {
 
 func (p *compoundParser) feed(token string) []provider.StreamEvent {
 	var events []provider.StreamEvent
-	text := p.buf.String() + token
-	p.buf.Reset()
+	var text string
+	if p.buf.Len() == 0 {
+		text = token
+	} else {
+		text = p.buf.String() + token
+		p.buf.Reset()
+	}
 
 	for len(text) > 0 {
 		idx := strings.Index(text, "<")

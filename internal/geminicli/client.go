@@ -3,10 +3,10 @@ package geminicli
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 
@@ -14,16 +14,45 @@ import (
 	"wlchat/internal/provider"
 )
 
+// stderrCap bounds how much stderr we retain from the child process so a
+// misbehaving CLI can't balloon memory. Older bytes are dropped, newer ones
+// kept (the tail is what's useful for diagnostics).
+const stderrCap = 64 * 1024
+
+type ringBuf struct {
+	buf [stderrCap]byte
+	n   int  // bytes written total (may exceed cap)
+	pos int  // next write position
+	full bool
+}
+
+func (r *ringBuf) Write(p []byte) (int, error) {
+	for _, b := range p {
+		r.buf[r.pos] = b
+		r.pos = (r.pos + 1) % stderrCap
+		if r.pos == 0 {
+			r.full = true
+		}
+		r.n++
+	}
+	return len(p), nil
+}
+
+func (r *ringBuf) String() string {
+	if !r.full {
+		return string(r.buf[:r.pos])
+	}
+	return string(r.buf[r.pos:]) + string(r.buf[:r.pos])
+}
+
+var _ io.Writer = (*ringBuf)(nil)
+
 var Models = []string{
 	"auto-gemini-3",
-	"gemini-3.1-pro",
-	"gemini-3.1-flash",
-	"gemini-3.1-flash-lite",
+	"gemini-3-pro-preview",
 	"gemini-2.5-pro",
 	"gemini-2.5-flash",
 	"gemini-2.5-flash-lite",
-	"gemini-3.1-pro-thinking",
-	"gemini-experimental",
 }
 
 type Client struct {
@@ -98,7 +127,7 @@ func (c *Client) StreamChat(ctx context.Context, messages []conversation.Message
 			ch <- provider.StreamEvent{Err: fmt.Errorf("gemini CLI: %w", err)}
 			return
 		}
-		var stderr bytes.Buffer
+		var stderr ringBuf
 		cmd.Stderr = &stderr
 
 		if err := cmd.Start(); err != nil {

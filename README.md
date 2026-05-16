@@ -34,6 +34,7 @@ export GEMINI_API_KEY="..."   # optional
 | `Ctrl+M`       | Toggle model picker                     |
 | `Ctrl+K`       | Toggle skill picker                     |
 | `Esc`          | Close popup / cancel in-flight stream   |
+| `Q`            | Quit (when input is not focused)        |
 
 Click the provider pill in the title bar to cycle between configured providers.
 
